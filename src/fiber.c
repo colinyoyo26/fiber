@@ -48,7 +48,7 @@ static ucontext_t context_main[K_THREAD_MAX];
 /* number of active threads */
 static int user_thread_num = 0;
 
-static __thread int preempt_disable_cnt = 0;
+static __thread int preempt_disable_count = 0;
 
 /* global spinlock for critical section _queue */
 static uint _spinlock = 0;
@@ -72,16 +72,17 @@ static struct itimerval zero_timer = {0};
 /* diable schedule of native thread */
 static inline void preempt_disable()
 {
-    __atomic_add_fetch(&preempt_disable_cnt, 1, __ATOMIC_ACQUIRE);
+    __atomic_add_fetch(&preempt_disable_count, 1, __ATOMIC_ACQUIRE);
 }
 
 static inline void preempt_enable()
 {
-    __atomic_sub_fetch(&preempt_disable_cnt, 1, __ATOMIC_RELEASE);
+    __atomic_sub_fetch(&preempt_disable_count, 1, __ATOMIC_RELEASE);
 }
 
 static inline void spin_lock(uint *lock)
 {
+    preempt_disable();
     while (__atomic_test_and_set(lock, __ATOMIC_ACQUIRE))
         ;
 }
@@ -89,18 +90,6 @@ static inline void spin_lock(uint *lock)
 static inline void spin_unlock(uint *lock)
 {
     __atomic_store_n(lock, 0, __ATOMIC_RELEASE);
-}
-
-/* Disable schedule when locking */
-static inline void spin_lock_schedsave(uint *lock)
-{
-    preempt_disable();
-    spin_lock(lock);
-}
-
-static inline void spin_unlock_schedrestore(uint *lock)
-{
-    spin_unlock(lock);
     preempt_enable();
 }
 
@@ -247,17 +236,17 @@ int fiber_yield()
 {
     uint k_tid = (uint) syscall(SYS_gettid);
     _tcb *cur_tcb = GET_TCB(cur_thread_node[k_tid & K_CONTEXT_MASK]);
-    spin_lock_schedsave(&_spinlock);
+    spin_lock(&_spinlock);
 
     if (RUNNING == cur_tcb->status) {
         cur_tcb->status = SUSPENDED;
         enqueue(thread_queue + cur_tcb->prio,
                 cur_thread_node[k_tid & K_CONTEXT_MASK]);
-        spin_unlock_schedrestore(&_spinlock);
+        spin_unlock(&_spinlock);
 
         swapcontext(&(cur_tcb->context), &context_main[k_tid & K_CONTEXT_MASK]);
     } else
-        spin_unlock_schedrestore(&_spinlock);
+        spin_unlock(&_spinlock);
     return 0;
 }
 
@@ -288,10 +277,10 @@ void fiber_exit(void *retval)
         (unsigned long *) malloc(sizeof(unsigned long));
     memcpy(sigsem_thread[currefiber_id].val, retval, sizeof(unsigned long));
 
-    spin_lock_schedsave(&_spinlock);
+    spin_lock(&_spinlock);
     enqueue(thread_queue + cur_tcb->prio,
             cur_thread_node[k_tid & K_CONTEXT_MASK]);
-    spin_unlock_schedrestore(&_spinlock);
+    spin_unlock(&_spinlock);
 
     swapcontext(&(cur_tcb->context), &context_main[k_tid & K_CONTEXT_MASK]);
 }
@@ -302,14 +291,14 @@ static void schedule()
     uint k_tid = (uint) syscall(SYS_gettid);
     _tcb *cur_tcb = GET_TCB(cur_thread_node[k_tid & K_CONTEXT_MASK]);
 
-    if (preempt_disable_cnt)
+    if (preempt_disable_count)
         return;
 
-    spin_lock_schedsave(&_spinlock);
+    spin_lock(&_spinlock);
     cur_tcb->status = SUSPENDED;
     enqueue(thread_queue + cur_tcb->prio,
             cur_thread_node[k_tid & K_CONTEXT_MASK]);
-    spin_unlock_schedrestore(&_spinlock);
+    spin_unlock(&_spinlock);
 
     swapcontext(&(cur_tcb->context), &context_main[k_tid & K_CONTEXT_MASK]);
 }
@@ -330,10 +319,10 @@ static void u_thread_exec_func(void (*thread_func)(void *),
     u_thread->context.uc_link = &context_main[k_tid & K_CONTEXT_MASK];
 
     /* When this thread finished, delete TCB and yield CPU control */
-    spin_lock_schedsave(&_spinlock);
+    spin_lock(&_spinlock);
     enqueue(thread_queue + u_thread->prio,
             cur_thread_node[k_tid & K_CONTEXT_MASK]);
-    spin_unlock_schedrestore(&_spinlock);
+    spin_unlock(&_spinlock);
 
     swapcontext(&u_thread->context, &context_main[k_tid & K_CONTEXT_MASK]);
 }
@@ -359,15 +348,15 @@ static void k_thread_exec_func(void *arg UNUSED)
      * until no available user-level thread
      */
     while (1) {
-        spin_lock_schedsave(&_spinlock);
+        spin_lock(&_spinlock);
 
         if (!dequeue(thread_queue, &run_node)) {
-            spin_unlock_schedrestore(&_spinlock);
+            spin_unlock(&_spinlock);
 
             setitimer(ITIMER_PROF, &zero_timer, &time_quantum);
             return;
         }
-        spin_unlock_schedrestore(&_spinlock);
+        spin_unlock(&_spinlock);
 
         run_tcb = GET_TCB(run_node);
 
@@ -436,9 +425,9 @@ int fiber_mutex_unlock(fiber_mutex_t *mutex)
     }
     cur_tcb = GET_TCB(next_node);
     cur_tcb->prio = 0;
-    spin_lock_schedsave(&_spinlock);
+    spin_lock(&_spinlock);
     enqueue(thread_queue + cur_tcb->prio, next_node);
-    spin_unlock_schedrestore(&_spinlock);
+    spin_unlock(&_spinlock);
     __atomic_store_n(&mutex->lock, 0, __ATOMIC_RELEASE);
     mutex->owner = NULL;
     return 0;
@@ -486,9 +475,9 @@ int fiber_cond_signal(fiber_cond_t *condvar)
 
     cur_tcb = GET_TCB(next_node);
     cur_tcb->prio = 0;
-    spin_lock_schedsave(&_spinlock);
+    spin_lock(&_spinlock);
     enqueue(thread_queue + cur_tcb->prio, next_node);
-    spin_unlock_schedrestore(&_spinlock);
+    spin_unlock(&_spinlock);
 
     return 0;
 }
